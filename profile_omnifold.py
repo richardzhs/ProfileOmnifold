@@ -208,7 +208,7 @@ def nonparametric_profile_omnifold(y, x_mc, y_mc, iterations, verbose=0):
     return weights
 
 
-def ad_hoc_penalized_profile_omnifold(y, x_mc, y_mc, iterations, w_func, theta_bar, theta0, no_penalty=False, verbose=0):
+def ad_hoc_penalized_profile_omnifold(y, x_mc, y_mc, iterations, w_func, theta0, theta_init, no_penalty=False, verbose=0):
 
     weights = np.empty(shape=(iterations, 4, len(x_mc)))
     # shape = (iteration, step, event)
@@ -243,7 +243,7 @@ def ad_hoc_penalized_profile_omnifold(y, x_mc, y_mc, iterations, w_func, theta_b
     weights_pull = np.ones(len(y_mc))
     weights_push = np.ones(len(y_mc))
     
-    theta = theta0
+    theta = theta_init
 
     for i in range(iterations):
         # initial weights on the response kernel are determined by the initial theta
@@ -295,7 +295,7 @@ def ad_hoc_penalized_profile_omnifold(y, x_mc, y_mc, iterations, w_func, theta_b
             if (isinstance(w_theta, torch.Tensor)):
                 w_theta = w_theta.cpu().numpy().flatten()
             if no_penalty == False:
-                return np.mean((w_theta - w * weights_pull / weights_push)**2) + (x[0]-theta_bar)**2/2
+                return np.mean((w_theta - w * weights_pull / weights_push)**2) + (x[0]-theta0)**2/2
             else:
                 return np.mean((w_theta - w * weights_pull / weights_push)**2)
         
@@ -313,7 +313,7 @@ def ad_hoc_penalized_profile_omnifold(y, x_mc, y_mc, iterations, w_func, theta_b
     return weights
 
 
-def penalized_profile_omnifold(y, x_mc, y_mc, iterations, w_func, w_func_derivative, theta_bar, theta0, no_penalty=False, verbose=0):
+def penalized_profile_omnifold(y, x_mc, y_mc, iterations, w_func, w_func_derivative, theta0, theta_init, no_penalty=False, verbose=0):
 
     weights = np.empty(shape=(iterations, 4, len(x_mc)))
     # shape = (iteration, step, event)
@@ -348,7 +348,7 @@ def penalized_profile_omnifold(y, x_mc, y_mc, iterations, w_func, w_func_derivat
     weights_pull = np.ones(len(y_mc))
     weights_push = np.ones(len(y_mc))
     
-    theta = theta0
+    theta = theta_init
 
     for i in range(iterations):
         # initial weights on the response kernel are determined by the initial theta
@@ -387,7 +387,7 @@ def penalized_profile_omnifold(y, x_mc, y_mc, iterations, w_func, w_func_derivat
                 w_next = w_next.cpu().numpy().flatten()
                 delta_w_next = delta_w_next.cpu().numpy().flatten()
             if no_penalty == False:
-                return x - theta_bar - np.mean(w*weights_push*delta_w_next/w_next*ry)
+                return x - theta0 - np.mean(w*weights_push*delta_w_next/w_next*ry)
             else:
                 return np.mean(w*weights_push*delta_w_next/w_next*ry)
         
@@ -416,10 +416,10 @@ def penalized_profile_omnifold(y, x_mc, y_mc, iterations, w_func, w_func_derivat
         
         weights_push = density_ratio_classifier(xvals_2, yvals_2, weights_2, x_mc, model2, verbose)
         
-        weights_3 = np.concatenate((np.ones(len(x_mc)), w_next))
+        #weights_3 = np.concatenate((np.ones(len(x_mc)), w_next))
         # ones for Gen. (not MC weights), actual weights for (reweighted) Gen.
         
-        weights_push = weights_push * 2 / (1 + density_ratio_classifier(xvals_2, yvals_2, weights_3, x_mc, model2, verbose))
+        #weights_push = weights_push * 2 / (1 + density_ratio_classifier(xvals_2, yvals_2, weights_3, x_mc, model2, verbose))
         weights[i, 1, :] = weights_push
         
     return weights

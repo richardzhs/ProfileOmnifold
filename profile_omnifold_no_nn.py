@@ -324,7 +324,7 @@ def nonparametric_profile_omnifold(y, x_mc, y_mc, niter, save_iter=False):
 
 
 
-def ad_hoc_penalized_profile_omnifold(y, x_mc, y_mc, theta_bar, theta0, w_func, niter, no_penalty=False, save_iter=False):
+def ad_hoc_penalized_profile_omnifold(y, x_mc, y_mc, theta0, theta_init, w_func, niter, no_penalty=False, save_iter=False):
     """
     Profile omnifold algorithm in the presence of nuisance parameter with penalization step
     derived from nonparametric profile omnifold.
@@ -337,9 +337,9 @@ def ad_hoc_penalized_profile_omnifold(y, x_mc, y_mc, theta_bar, theta0, w_func, 
         The Monte Carlo particle-level events (row = events, column = features).     
     y_mc : 2darray
         The Monte Carlo detector-level events (row = events, column = features).
-    theta_bar : float
-        nuisance parameter for the Monte Carlo dataset      
     theta0 : float
+        nuisance parameter for the Monte Carlo dataset      
+    theta_init : float
         Initial value for the nuisance parameter
     w_func : callable
         A function that computes the reweighting factors on the MC dataset given an input theta
@@ -359,7 +359,7 @@ def ad_hoc_penalized_profile_omnifold(y, x_mc, y_mc, theta_bar, theta0, w_func, 
     """
     
     nu = np.ones(x_mc.shape[0])
-    theta = theta0
+    theta = theta_init
     if save_iter:
         iter_log = np.zeros((niter,4,x_mc.shape[0]))
 
@@ -384,7 +384,7 @@ def ad_hoc_penalized_profile_omnifold(y, x_mc, y_mc, theta_bar, theta0, w_func, 
         def theta_loss(x):
             w_theta = w_func(x[0])
             if no_penalty == False:
-                return np.mean((w_theta - w * nu / nunext * ry)**2) + (x[0]-theta_bar)**2/2
+                return np.mean((w_theta - w * nu / nunext * ry)**2) + (x[0]-theta0)**2/2
             else:
                 return np.mean((w_theta - w * nu / nunext * ry)**2)
         
@@ -405,7 +405,7 @@ def ad_hoc_penalized_profile_omnifold(y, x_mc, y_mc, theta_bar, theta0, w_func, 
         return nu
 
     
-def penalized_profile_omnifold(y, x_mc, y_mc, theta_bar, theta0, w_func, w_func_derivative, niter, no_penalty=False, save_iter=False):
+def penalized_profile_omnifold(y, x_mc, y_mc, theta0, theta_init, w_func, w_func_derivative, niter, no_penalty=False, save_iter=False):
     """
     Profile omnifold algorithm in the presence of nuisance parameter.
 
@@ -417,9 +417,9 @@ def penalized_profile_omnifold(y, x_mc, y_mc, theta_bar, theta0, w_func, w_func_
         The Monte Carlo particle-level events (row = events, column = features).     
     y_mc : 2darray
         The Monte Carlo detector-level events (row = events, column = features).
-    theta_bar : float
-        nuisance parameter for the Monte Carlo dataset      
     theta0 : float
+        nuisance parameter for the Monte Carlo dataset      
+    theta_init : float
         Initial value for the nuisance parameter
     w_func : callable
         A function that computes the reweighting factors on the MC dataset given an input theta
@@ -440,7 +440,7 @@ def penalized_profile_omnifold(y, x_mc, y_mc, theta_bar, theta0, w_func, w_func_
         3rd coordinate is the weights evaluated on each Monte Carlo event
     """
     nu = np.ones(x_mc.shape[0])
-    theta = theta0
+    theta = theta_init
     if save_iter:
         iter_log = np.zeros((niter,4,x_mc.shape[0]))
 
@@ -460,7 +460,7 @@ def penalized_profile_omnifold(y, x_mc, y_mc, theta_bar, theta0, w_func, w_func_
             w_next = w_func(x)
             delta_w_next = w_func_derivative(x)
             if no_penalty == False:
-                return x - theta_bar - np.mean(w*nu*delta_w_next/w_next*ry)
+                return x - theta0 - np.mean(w*nu*delta_w_next/w_next*ry)
             else:
                 return np.mean(w*nu*delta_w_next/w_next*ry)
             
@@ -470,7 +470,7 @@ def penalized_profile_omnifold(y, x_mc, y_mc, theta_bar, theta0, w_func, w_func_
         #def theta_loss(x):
         #    w_next = w_func(x[0])
         #    delta_w_next = w_func_derivative(x[0])
-        #    return (x[0] - theta_bar - np.mean(w*nu*delta_w_next/w_next*ry))**2
+        #    return (x[0] - theta0 - np.mean(w*nu*delta_w_next/w_next*ry))**2
         #solution = optimize.minimize(theta_loss, theta)
         #theta = solution.x[0]
         #if t == 5:
@@ -481,9 +481,9 @@ def penalized_profile_omnifold(y, x_mc, y_mc, theta_bar, theta0, w_func, w_func_
 
         print("Fitting pull-back weights on x_mc...")
         X2 = np.concatenate((x_mc[choices(np.arange(x_mc.shape[0]), weights=ry*w, k=x_mc.shape[0]),:], x_mc))
-        X3 = np.concatenate((x_mc[choices(np.arange(x_mc.shape[0]), weights=w_next, k=x_mc.shape[0]),:], x_mc))
+        #X3 = np.concatenate((x_mc[choices(np.arange(x_mc.shape[0]), weights=w_next, k=x_mc.shape[0]),:], x_mc))
         labels2 = np.concatenate((np.zeros(x_mc.shape[0]), np.ones(x_mc.shape[0])))
-        nu = nu * density_ratio_classifier(X2, labels2, X_eval=x_mc) * 2 / (1+density_ratio_classifier(X3, labels2, X_eval=x_mc))
+        nu = nu * density_ratio_classifier(X2, labels2, X_eval=x_mc) #* 2 / (1+density_ratio_classifier(X3, labels2, X_eval=x_mc))
         print("updated weight on x_mc:", nu, "\n")
         
         if save_iter:
