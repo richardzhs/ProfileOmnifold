@@ -91,7 +91,6 @@ def generate_IBU_point_estimators(y, K, niter):
 
 
 # Visualization
-
 class comparison_plots_with_ratio:
     
     def __init__(self, xmin, xmax, nbins, xlabel=r"$T$", ratio_label="Data/Pred.", header="Gaussian Example", density=True, save_name=None, legend_corner="upper left"):
@@ -154,7 +153,38 @@ class comparison_plots_with_ratio:
             self.nTs.append(nT)
             self.bTs.append(bT)
             self.argss.append(args)
+
+    def add_ensemble(self, data, label, weights_list, target=False, histtype=None, color=None, ls=None, lw=None, alpha=None):
+        args = {"label": label}
+        if type(histtype) != type(None): args["histtype"] = histtype
+        if type(color) != type(None): args["color"] = color
+        if type(ls) != type(None): args["ls"] = ls
+        if type(lw) != type(None): args["lw"] = lw
+        if type(alpha) != type(None): args["alpha"] = alpha
+
+        # Accumulate histogram counts/density
+        total_nT = np.zeros(self.nbins-1)  # Initialize an array to store the sum of bin counts
         
+        for weights in weights_list:
+            nT, bT = np.histogram(data, bins=np.linspace(self.xmin, self.xmax, self.nbins), weights=weights)
+            total_nT += nT  # Accumulate counts
+        
+        # Compute the mean histogram
+        mean_nT = total_nT / len(weights_list)
+        
+        # **Reconstruct synthetic data** for the final plot on the mean
+        synthetic_data = np.repeat((bT[:-1] + bT[1:]) / 2, mean_nT.astype(int))
+
+        nT, bT, _ = self.ax0.hist(synthetic_data, bins=np.linspace(self.xmin, self.xmax, self.nbins), density=self.density, **args)
+            
+        if target:
+            self.nTt = nT
+            self.bTt = bT
+        else:
+            self.nTs.append(nT)
+            self.bTs.append(bT)
+            self.argss.append(args)
+    
     def plot_ratio(self):
         if type(self.nTt) == type(None):
             return
@@ -178,7 +208,8 @@ class comparison_plots_with_ratio:
     def show(self):
         self.plot_ratio()
         self.ax0.locator_params(axis='y', nbins=6)
-        self.ax0.legend(frameon=False,fontsize=20, loc=self.legend_corner)
+        self.ax0.legend(frameon=False,fontsize=12, loc=self.legend_corner)
         self.save()
         plt.show()
         plt.clf()
+
