@@ -1,5 +1,6 @@
 # Profile Omnifold
 This repository contains the codebase for the **Profile OmniFold** algorithm.
+
 **Note:** This codebase is actively under development.
 
 
@@ -7,7 +8,7 @@ This repository contains the codebase for the **Profile OmniFold** algorithm.
 The repository currently includes the following files:
 
 * **`profile_omnifold.py`** 
-  Implements the main methods for running the Profile OmniFold algorithm, along with the original OmniFold and several related variants. Specifically, it provides:
+  Implements the main methods for running both the Profile OmniFold algorithm and the original OmniFold algorithm. The key functions are:
   1. `omnifold`: the original OmniFold algorithm.
   2. `profile_omnifold`: the Profile OmniFold algorithm.
 
