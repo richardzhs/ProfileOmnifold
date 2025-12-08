@@ -1,14 +1,24 @@
 # Profile Omnifold
-This repository contains codes for Profile OmniFold algorithm.
+This repository contains the codebase for the **Profile OmniFold** algorithm.
+**Note:** This codebase is actively under development.
 
 
 ## Overview
-The repository includes the following files:
+The repository currently includes the following files:
 
-* `profile_omnifold.py`: Contains the main methods for running the Profile OmniFold algorithm, as well as the original Omnifold and its various versions. Speficifically, the following algorithms are included.
-  1. `omnifold`: original OmniFold algorithm
-  2. `profile_omnifold`: Profile OmniFold algorithmW
-* `profile_omnifold_no_nn.py`: Provides the same methods as `profile_omnifold.py`, but without using neural networks for classifier training.
-* `utils.py`: Utility functions.
-* `Gaussian_example.ipynb`: Jupyter notebook demonstrating the Profile Omnifold algorithm on a Gaussian Example.
-* `OpenData_example.ipynb`: Jupyter notebook demonstrating the Profile Omnifold algorithm on [CMS open dataset](https://energyflow.network/docs/datasets/).
+* **`profile_omnifold.py`** 
+  Implements the main methods for running the Profile OmniFold algorithm, along with the original OmniFold and several related variants. Specifically, it provides:
+  1. `omnifold`: the original OmniFold algorithm.
+  2. `profile_omnifold`: the Profile OmniFold algorithm.
+
+* **`profile_omnifold_no_nn.py`**
+  Contains the same methods as `profile_omnifold.py`, but replaces neural networks with non–neural network classifiers.
+
+* **`utils.py`**
+  A coollection of utility functions used across the codebase.
+
+* **`Gaussian_example.ipynb`**
+  A Jupyter notebook demonstrating the Profile Omnifold algorithm on a Gaussian example.
+
+* **`OpenData_example.ipynb`**
+  A Jupyter notebook demonstrating the Profile Omnifold algorithm on [CMS open dataset](https://energyflow.network/docs/datasets/).
