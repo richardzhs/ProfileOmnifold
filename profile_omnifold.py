@@ -1,6 +1,8 @@
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 import tensorflow.keras.backend as K
+from tensorflow.keras.callbacks import EarlyStopping
 from keras.layers import Dense, Input
 from keras.models import Model
 from sklearn.model_selection import train_test_split, ShuffleSplit
@@ -8,12 +10,8 @@ import copy
 import torch
 from torch.utils.data import Dataset
 from torch.utils.data import random_split, DataLoader
-from torch import nn, optim
-from torch.func import vmap, grad
-import gc
+from torch import nn
 from sklearn.metrics import accuracy_score, roc_curve, auc, confusion_matrix, roc_auc_score
-from scipy import optimize
-from scipy import stats
 dvc = "cuda" if torch.cuda.is_available() else "cpu"
 
 def reweight(events,model,batch_size=10000):
@@ -36,7 +34,8 @@ def reweight(events,model,batch_size=10000):
     """
     f = model.predict(events, batch_size=batch_size)
     weights = f / (1. - f)
-    weights[np.isinf(weights)] = 1
+    #weights[np.isinf(weights)] = 1
+    weights = np.clip(weights, 0, 10)
     return np.squeeze(np.nan_to_num(weights))
 
 # Binary crossentropy for classifying two samples with weights
@@ -70,7 +69,20 @@ def weighted_binary_crossentropy(y_true, y_pred):
 
     return K.mean(t_loss)
 
-def density_ratio_classifier(xvals, yvals, weights, xeval, model, epochs=10, verbose=0):
+def weighted_accuracy(y_true, y_pred):
+    """
+    Computes the weighted classification accuracy
+    """
+    # Extract labels and weights
+    y_actual, weights = tf.gather(y_true, [0], axis=1), tf.gather(y_true, [1], axis=1)
+    y_pred_classes = K.round(y_pred)
+    # Check correctness
+    correct = K.cast(K.equal(y_actual, y_pred_classes), K.floatx())
+    # Compute weighted accuracy
+    return K.sum(correct * weights) / K.sum(weights)  
+
+
+def density_ratio_classifier(xvals, yvals, weights, xeval, model, epochs=10, lr=0.001, patience=3, verbose=0, return_history=False):
     """
     Estimate the density ratio by fitting a neural network classifier.
 
@@ -87,14 +99,22 @@ def density_ratio_classifier(xvals, yvals, weights, xeval, model, epochs=10, ver
     model : keras model
         The model to use for the classifier.
     epochs : int, optional
-        The number of epochs to train the classifier.
+        The maximum number of epochs to train the classifier.
+    lr : float, optional
+        The learning rate for the optimizer.
+    patience : int, optional
+        The number of epochs with no improvement after which training will be stopped.
     verbose : int, optional
         The verbosity level of the classifier.
+    return_history : bool, optional
+        Whether to return the training history.
 
     Returns
     -------
     weights : array-like, shape=(n_eval_samples,)
-        The density ratio evaluated at xeval.
+        The estimated density ratio at the evaluation points.
+    history : dict, optional
+        The training history if return_history is True.
 
     """
 
@@ -105,19 +125,33 @@ def density_ratio_classifier(xvals, yvals, weights, xeval, model, epochs=10, ver
     Y_test = np.stack((Y_test, w_test), axis=1)   
 
 
+    early_stopping = EarlyStopping(
+        monitor='val_loss',
+        patience=patience, # Stop if no improvement after patience epochs
+        restore_best_weights=True
+    )
+    
     model.compile(loss=weighted_binary_crossentropy,
-                  optimizer='Adam',
-                  metrics=['accuracy'])
-    model.fit(X_train,
-              Y_train,
-              epochs=epochs, # more epochs, learning curve
-              batch_size=10000,
-              validation_data=(X_test, Y_test),
-              verbose=verbose)
-    return reweight(xeval,model)
+                  optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+                  metrics=['accuracy', weighted_accuracy])
+    
+    history = model.fit(
+        X_train,
+        Y_train,
+        epochs=epochs,
+        batch_size=10000,
+        validation_data=(X_test, Y_test),
+        verbose=verbose,
+        callbacks=[early_stopping]
+    )
+    
+    if return_history:
+        return reweight(xeval,model), history.history
+    else:
+        return reweight(xeval,model)
 
 
-def omnifold(y,x_mc,y_mc,iterations,verbose=0):
+def omnifold(y, x_mc, y_mc, iterations, epochs=10, lr=0.001, patience=3, verbose=0, return_acc=True, return_loss=True):
     """
     Omnifold algorithm.
 
@@ -131,15 +165,26 @@ def omnifold(y,x_mc,y_mc,iterations,verbose=0):
         The Monte Carlo detector-level data.
     iterations : int
         The number of iterations to run the algorithm.
+    epochs : int, optional
+        The maximum number of epochs to train the classifier.
+    lr : float, optional
+        The learning rate for the optimizer.
+    patience : int, optional
+        The number of epochs with no improvement after which training will be stopped.
     verbose : int, optional
         The verbosity level of the classifier.
+    return_acc : bool, optional
+        Whether to return the classification accuracy.
+    return_loss : bool, optional
+        Whether to return the cross-entropy loss.
 
     Returns
     -------
-    weights : array-like, shape=(iterations, 2, n_samples)
-        The weights for each iteration and step.
+    result : dict
+        A dictionary containing the weights and optionally the accuracy and loss.
     """
-
+    K.clear_session()
+    
     weights = np.empty(shape=(iterations, 2, len(x_mc)))
     # shape = (iteration, step, event)
 
@@ -168,7 +213,13 @@ def omnifold(y,x_mc,y_mc,iterations,verbose=0):
     outputs2 = Dense(1, activation='sigmoid')(hidden_layer_6)
 
     model2 = Model(inputs=inputs2, outputs=outputs2)
-    
+
+    # step 1 train/validation accuracy in each iteration
+    train_acc_step1 = []
+    val_acc_step1 = []
+    # step 1 train/validation cross-entropy loss in each iteration
+    train_loss_step1 = []
+    val_loss_step1 = []
     
     # initial iterative weights are ones
     weights_pull = np.ones(len(y_mc))
@@ -186,8 +237,17 @@ def omnifold(y,x_mc,y_mc,iterations,verbose=0):
 
         weights_1 = np.concatenate((weights_push, np.ones(len(y))))
 
-        weights_pull = weights_push * density_ratio_classifier(xvals_1, yvals_1, weights_1, y_mc, model1, verbose=verbose)
+        ry, history = density_ratio_classifier(xvals_1, yvals_1, weights_1, y_mc, model1, verbose=verbose, epochs=epochs, lr=lr, patience=patience,
+                                               return_history=True)
+        weights_pull = weights_push * ry
         weights[i, :1, :] = weights_pull
+
+        if return_acc:
+            train_acc_step1.append(history['weighted_accuracy'])
+            val_acc_step1.append(history['val_weighted_accuracy'])
+        if return_loss:
+            train_loss_step1.append(history['loss'])
+            val_loss_step1.append(history['val_loss'])
 
         # STEP 2: classify Gen. to reweighted Gen. (which is reweighted by weights_pull)
         # weights Gen. --> reweighted Gen.
@@ -197,213 +257,81 @@ def omnifold(y,x_mc,y_mc,iterations,verbose=0):
         weights_2 = np.concatenate((np.ones(len(x_mc)), weights_pull))
         # ones for Gen. (not MC weights), actual weights for (reweighted) Gen.
 
-        weights_push = density_ratio_classifier(xvals_2, yvals_2, weights_2, x_mc, model2, verbose=verbose)
+        weights_push = density_ratio_classifier(xvals_2, yvals_2, weights_2, x_mc, model2, verbose=verbose, epochs=epochs, lr=lr, patience=patience)
         weights[i, 1:2, :] = weights_push
 
-    return weights
+        
+    result = {"weights": weights}
+    row_names = [f"Iteration{i+1}" for i in range(iterations)]
+    col_names = [f"Epoch{i+1}" for i in range(epochs)]
+    if return_acc:
+        pad_train_acc_step1 = [row + [np.nan] * (len(col_names) - len(row)) for row in train_acc_step1]
+        pad_val_acc_step1 = [row + [np.nan] * (len(col_names) - len(row)) for row in val_acc_step1]
+        df_train_acc = pd.DataFrame(pad_train_acc_step1, index=row_names, columns=col_names)  
+        df_val_acc = pd.DataFrame(pad_val_acc_step1, index=row_names, columns=col_names)
+        result["step1_train_acc"] = df_train_acc
+        result["step1_val_acc"] = df_val_acc
+    if return_loss:
+        pad_train_loss_step1 = [row + [np.nan] * (len(col_names) - len(row)) for row in train_loss_step1]
+        pad_val_loss_step1 = [row + [np.nan] * (len(col_names) - len(row)) for row in val_loss_step1]
+        df_train_loss = pd.DataFrame(pad_train_loss_step1, index=row_names, columns=col_names)
+        df_val_loss = pd.DataFrame(pad_val_loss_step1, index=row_names, columns=col_names)    
+        result["step1_train_loss"] = df_train_loss
+        result["step1_val_loss"] = df_val_loss
+
+    return result
 
 
-def nonparametric_profile_omnifold(y, x_mc, y_mc, iterations, verbose=0):
 
-    weights = np.empty(shape=(iterations, 3, len(x_mc)))
-    # shape = (iteration, step, event)
+def profile_omnifold(y, x_mc, y_mc, iterations, w_theta, theta_bar, theta0, theta_range, num_grid_points=20, no_penalty=False, epochs=10, 
+                     lr=0.001, patience=3, verbose=0, return_Q=False, return_acc=False, return_loss=False):
+    """
+    Profiled Omnifold algorithm.
 
-    labels0 = np.zeros(len(x_mc))
-    labels_unknown = np.ones(len(y))
-    labels_unknown_step2 = np.ones(len(x_mc))
+    Parameters
+    ----------
+    y : array-like, shape=(n_samples, n_features)
+        The data to reweight.
+    x_mc : array-like, shape=(n_samples, n_features)
+        The Monte Carlo particle-level data.
+    y_mc : array-like, shape=(n_samples, n_features)
+        The Monte Carlo detector-level data.
+    iterations : int
+        The number of iterations to run the algorithm.
+    w_theta : function
+        w function that is parameterized by theta.
+    theta_bar : float
+        The central value of theta for the penalty term.
+    theta0 : float
+        The initial value of theta.
+    theta_range : tuple
+        The range of theta values to consider (min, max).
+    num_grid_points : int, optional
+        The number of grid points to evaluate the Q function.
+    epochs : int, optional
+        The number of training epochs for the neural networks.
+    lr : float, optional
+        The learning rate for the optimizer.
+    patience : int, optional
+        The number of epochs with no improvement after which training will be stopped.
+    verbose : int, optional
+        The verbosity level of the classifier.
+    return_Q : bool, optional
+        Whether to return the Q function values.
+    return_acc : bool, optional
+        Whether to return the classification accuracy.
+    return_loss : bool, optional
+        Whether to return the cross-entropy loss.
 
-    xvals_1 = np.concatenate((y_mc, y))
-    yvals_1 = np.concatenate((labels0, labels_unknown))
 
-    xvals_2 = np.concatenate((x_mc, x_mc))
-    yvals_2 = np.concatenate((labels0, labels_unknown_step2))
+    Returns
+    -------
+    result : dict
+        A dictionary containing the weights and optionally the Q function values, accuracy, and loss.
+    """ 
+    K.clear_session()
     
-    inputs1 = Input((y.shape[1], ))
-    hidden_layer_1 = Dense(50, activation='relu')(inputs1)
-    hidden_layer_2 = Dense(50, activation='relu')(hidden_layer_1)
-    hidden_layer_3 = Dense(50, activation='relu')(hidden_layer_2)
-    outputs1 = Dense(1, activation='sigmoid')(hidden_layer_3)
-
-    model1 = Model(inputs=inputs1, outputs=outputs1)
-    
-    inputs2 = Input((x_mc.shape[1], ))
-    hidden_layer_4 = Dense(50, activation='relu')(inputs2)
-    hidden_layer_5 = Dense(50, activation='relu')(hidden_layer_4)
-    hidden_layer_6 = Dense(50, activation='relu')(hidden_layer_5)
-    outputs2 = Dense(1, activation='sigmoid')(hidden_layer_6)
-
-    model2 = Model(inputs=inputs2, outputs=outputs2)
-
-    # initial iterative weights are ones
-    weights_pull = np.ones(len(y_mc))
-    weights_push = np.ones(len(y_mc))
-    
-    # initial weights on the response kernel
-    w = np.ones(len(y_mc))
-
-    for i in range(iterations):
-
-        print("\nITERATION: {}\n".format(i + 1))
-
-        # STEP 1: classify Sim. (which is reweighted by weights_push) to Data
-        # weights reweighted Sim. --> Data
-
-        print("STEP 1\n")
-
-        weights_1 = np.concatenate((weights_push * w, np.ones(len(y))))
-
-        weights_pull = weights_push * density_ratio_classifier(xvals_1, yvals_1, weights_1, y_mc, model1, verbose=verbose)
-        weights[i, :1, :] = weights_pull
-
-
-        # STEP 2: classify Gen. to reweighted Gen. (which is reweighted by weights_pull)
-        # weights Gen. --> reweighted Gen.
-
-        print("\nSTEP 2\n")
-
-        weights_2 = np.concatenate((np.ones(len(x_mc)), weights_pull * w))
-        # ones for Gen. (not MC weights), actual weights for (reweighted) Gen.
-
-        weights_push = density_ratio_classifier(xvals_2, yvals_2, weights_2, x_mc, model2, verbose)
-        weights[i, 1:2, :] = weights_push
-
-
-        # STEP 3: update w
-        print("\nSTEP 3\n")
-        print(f'Update w...')
-        w =  w * weights_pull / weights_push
-        weights[i, 2:3, :] = w
-        
-    return weights
-
-
-
-def profile_omnifold(y, x_mc, y_mc, iterations, w_theta, w_theta_grad, theta_bar, theta0, no_penalty=False, theta_range=None,                                          first_order=False, lr=0.01, verbose=0):
-
-    weights = np.empty(shape=(iterations, 4, len(x_mc)))
-    # shape = (iteration, step, event)
-
-    labels0 = np.zeros(len(x_mc))
-    labels_unknown = np.ones(len(y))
-    labels_unknown_step2 = np.ones(len(x_mc))
-
-    xvals_1 = np.concatenate((y_mc, y))
-    yvals_1 = np.concatenate((labels0, labels_unknown))
-
-    xvals_2 = np.concatenate((x_mc, x_mc))
-    yvals_2 = np.concatenate((labels0, labels_unknown_step2))
-    
-    inputs1 = Input((y.shape[1], ))
-    hidden_layer_1 = Dense(50, activation='relu')(inputs1)
-    hidden_layer_2 = Dense(50, activation='relu')(hidden_layer_1)
-    hidden_layer_3 = Dense(50, activation='relu')(hidden_layer_2)
-    outputs1 = Dense(1, activation='sigmoid')(hidden_layer_3)
-
-    model1 = Model(inputs=inputs1, outputs=outputs1)
-    
-    inputs2 = Input((x_mc.shape[1], ))
-    hidden_layer_4 = Dense(50, activation='relu')(inputs2)
-    hidden_layer_5 = Dense(50, activation='relu')(hidden_layer_4)
-    hidden_layer_6 = Dense(50, activation='relu')(hidden_layer_5)
-    outputs2 = Dense(1, activation='sigmoid')(hidden_layer_6)
-
-    model2 = Model(inputs=inputs2, outputs=outputs2)
-
-    # initial iterative weights are ones
-    weights_pull = np.ones(len(y_mc))
-    weights_push = np.ones(len(y_mc))
-    
-    theta = theta0
-
-    for i in range(iterations):
-        # initial weights on the response kernel are determined by the initial theta
-        w = w_theta(theta)
-        if (isinstance(w, torch.Tensor)):
-            w = w.cpu().numpy().flatten()
-
-
-        print("\nITERATION: {}\n".format(i + 1))
-
-        # STEP 1: classify Sim. (which is reweighted by weights_push) to Data
-        # weights reweighted Sim. --> Data
-
-
-        print("STEP 1\n")
-
-
-        weights_1 = np.concatenate((weights_push * w, np.ones(len(y))))
-
-        ry = density_ratio_classifier(xvals_1, yvals_1, weights_1, y_mc, model1, verbose=verbose)
-        weights_pull = weights_push * ry
-        weights[i, 0, :] = weights_pull
-        
-        # STEP 2: classify Gen. to reweighted Gen. (which is reweighted by weights_pull)
-        # weights Gen. --> reweighted Gen.
-
-        print("\nSTEP 2\n")
-
-
-        weights_2 = np.concatenate((np.ones(len(x_mc)), weights_pull * w))
-        # ones for Gen. (not MC weights), actual weights for (reweighted) Gen.
-
-        
-        weights_push = density_ratio_classifier(xvals_2, yvals_2, weights_2, x_mc, model2, verbose=verbose)
-        
-        #weights_3 = np.concatenate((np.ones(len(x_mc)), w_next))
-        # ones for Gen. (not MC weights), actual weights for (reweighted) Gen.
-        
-        #weights_push = weights_push * (1+lambda2) / (1 + lambda1*density_ratio_classifier(xvals_2, yvals_2, weights_3, x_mc, model2, verbose=verbose))
-        weights[i, 1, :] = weights_push
-        
-        # STEP 3: update theta
-        print("\nSTEP 3\n")
-        print(f'Value of Theta before update: {theta}')
-        
-        
-        if first_order == False:
-            # direct optimization
-            def theta_func(x):
-                w_next = w_theta(x)
-                delta_w_next = w_theta_grad(x)
-                if (isinstance(w_next, torch.Tensor)):
-                    w_next = w_next.cpu().numpy().flatten()
-                    delta_w_next = delta_w_next.detach().cpu().numpy().flatten()
-                if no_penalty:
-                    return np.mean(w*weights_push*delta_w_next/w_next*ry)
-                else:
-                    return x - theta_bar - np.mean(w*weights_push*delta_w_next/w_next*ry)
-            if theta_range is not None:
-                solution = optimize.root_scalar(theta_func, bracket = theta_range, method='bisect')
-            else:
-                solution = optimize.root_scalar(theta_func, x0=theta, method='secant')
-            theta = solution.root
-        else:
-            # first-order update
-            w_next = w_theta(theta)
-            delta_w_next = w_theta_grad(theta)
-            if (isinstance(w_next, torch.Tensor)):
-                    w_next = w_next.cpu().numpy().flatten()
-                    delta_w_next = delta_w_next.detach().cpu().numpy().flatten()
-            if no_penalty:
-                theta = theta + lr * np.mean(w*weights_push*delta_w_next/w_next*ry)
-            else:
-                theta = theta + lr * (np.mean(w*weights_push*delta_w_next/w_next*ry) - (theta - theta_bar))
-        
-
-        print(f'Updated value of Theta: {theta}')
-        w_next = w_theta(theta)
-        if (isinstance(w_next, torch.Tensor)):
-            w_next = w_next.cpu().numpy().flatten()
-        weights[i, 2, :] = w_next
-        weights[i, 3, :] = theta
-        
-    return weights
-
-
-def profile_omnifold_no_grad(y, x_mc, y_mc, iterations, w_theta, theta_bar, theta0, theta_range, num_grid_points=20, no_penalty=False, 
-                             x_range=None, y_range=None, verbose=0, return_Q=False):
-    
-    weights = np.empty(shape=(iterations, 4, len(x_mc)))
+    weights = np.empty(shape=(iterations, 5, len(x_mc)))
     # shape = (iteration, step, event)
 
     labels0 = np.zeros(len(x_mc))
@@ -454,12 +382,19 @@ def profile_omnifold_no_grad(y, x_mc, y_mc, iterations, w_theta, theta_bar, thet
         w_grid.append(w_theta(theta_values[i]))
         if (isinstance(w_grid[i], torch.Tensor)):
             w_grid[i] = w_grid[i].cpu().numpy().flatten()
+    # step 1 train/validation accuracy in each iteration
+    train_acc_step1 = []
+    val_acc_step1 = []
+    # step 1 train/validation cross-entropy loss in each iteration
+    train_loss_step1 = []
+    val_loss_step1 = []
     
     print(f'Initial Theta: {theta}')
 
     for i in range(iterations):
 
         print("\nITERATION: {}\n".format(i + 1))
+        
 
         # STEP 1: classify Sim. (which is reweighted by weights_push) to Data
         # weights reweighted Sim. --> Data
@@ -467,11 +402,20 @@ def profile_omnifold_no_grad(y, x_mc, y_mc, iterations, w_theta, theta_bar, thet
         print("STEP 1\n")
 
         weights_1 = np.concatenate((weights_push * w, np.ones(len(y))))
-
-        ry = density_ratio_classifier(xvals_1, yvals_1, weights_1, y_mc, model1, verbose=verbose)
+        
+        ry, history = density_ratio_classifier(xvals_1, yvals_1, weights_1, y_mc, model1, verbose=verbose, epochs=epochs, lr=lr, patience=patience,
+                                               return_history=True)
         weights_pull = weights_push * ry
         weights[i, 0, :] = weights_pull
-        
+        weights[i, 4, :] = ry
+        if return_acc:
+            train_acc_step1.append(history['weighted_accuracy'])
+            val_acc_step1.append(history['val_weighted_accuracy'])
+        if return_loss:
+            train_loss_step1.append(history['loss'])
+            val_loss_step1.append(history['val_loss'])
+
+
         # STEP 2: classify Gen. to reweighted Gen. (which is reweighted by weights_pull)
         # weights Gen. --> reweighted Gen.
 
@@ -480,23 +424,21 @@ def profile_omnifold_no_grad(y, x_mc, y_mc, iterations, w_theta, theta_bar, thet
         weights_2 = np.concatenate((np.ones(len(x_mc)), weights_pull * w))
         # ones for Gen. (not MC weights), actual weights for (reweighted) Gen.
         
-        weights_push = density_ratio_classifier(xvals_2, yvals_2, weights_2, x_mc, model2, verbose=verbose)
+        weights_push = density_ratio_classifier(xvals_2, yvals_2, weights_2, x_mc, model2, verbose=verbose, epochs=epochs, lr=lr, patience=patience)
         weights[i, 1, :] = weights_push
-        
+
+
         # STEP 3: update theta
         print("\nSTEP 3\n")
         print(f'Value of Theta before update: {theta}')
 
         def Q(x):
-            #w_next = w_theta(x)
-            #if (isinstance(w_next, torch.Tensor)):
-            #        w_next = w_next.cpu().numpy().flatten()
             w_next = w_grid[np.argmin(np.abs(theta_values - x))]
 
             if i == 0:
-                Q_out = np.mean(w*ry*np.log(w_next*weights_push))
+                Q_out = np.mean(w*ry*np.log(w_next))
             else:
-                Q_out = np.mean(w*weights[i-1, 1, :]*ry*np.log(w_next*weights_push))
+                Q_out = np.mean(w*weights[i-1, 1, :]*ry*np.log(w_next))
             if no_penalty:
                 return Q_out
             else:
@@ -516,191 +458,52 @@ def profile_omnifold_no_grad(y, x_mc, y_mc, iterations, w_theta, theta_bar, thet
         optimal_index = np.argmax(Q_values)
         theta = theta_values[optimal_index]
         
-        
         print(f'Updated value of Theta: {theta}')
         w = w_grid[optimal_index]
-        #w = w_theta(theta)
-        #if (isinstance(w, torch.Tensor)):
-        #    w = w.cpu().numpy().flatten()
         weights[i, 2, :] = w
         weights[i, 3, :] = theta
+        
 
+    row_names = [f"Iteration{i+1}" for i in range(iterations)]
+    col_names = [f"Epoch{i+1}" for i in range(epochs)]
+    result = {"weights": weights, "theta0": theta0}
     if return_Q:
-        return weights, theta_values, Q_iter
-    else:
-        return weights
+        result["theta_grid"] = theta_values
+        result["Q"] = Q_iter
+    if return_acc:
+        pad_train_acc_step1 = [row + [np.nan] * (len(col_names) - len(row)) for row in train_acc_step1]
+        pad_val_acc_step1 = [row + [np.nan] * (len(col_names) - len(row)) for row in val_acc_step1]
+        df_train_acc = pd.DataFrame(pad_train_acc_step1, index=row_names, columns=col_names)  
+        df_val_acc = pd.DataFrame(pad_val_acc_step1, index=row_names, columns=col_names)
+        result["step1_train_acc"] = df_train_acc
+        result["step1_val_acc"] = df_val_acc
+    if return_loss:
+        pad_train_loss_step1 = [row + [np.nan] * (len(col_names) - len(row)) for row in train_loss_step1]
+        pad_val_loss_step1 = [row + [np.nan] * (len(col_names) - len(row)) for row in val_loss_step1]
+        df_train_loss = pd.DataFrame(pad_train_loss_step1, index=row_names, columns=col_names)
+        df_val_loss = pd.DataFrame(pad_val_loss_step1, index=row_names, columns=col_names)    
+        result["step1_train_loss"] = df_train_loss
+        result["step1_val_loss"] = df_val_loss
+
+    return result
 
 
 
-def profile_omnifold_known_nuisance(y, x_mc, y_mc, iterations, w, verbose=0):
 
-    weights = np.empty(shape=(iterations, 2, len(x_mc)))
-    # shape = (iteration, step, event)
-
-    labels0 = np.zeros(len(x_mc))
-    labels_unknown = np.ones(len(y))
-    labels_unknown_step2 = np.ones(len(x_mc))
-
-    xvals_1 = np.concatenate((y_mc, y))
-    yvals_1 = np.concatenate((labels0, labels_unknown))
-
-    xvals_2 = np.concatenate((x_mc, x_mc))
-    yvals_2 = np.concatenate((labels0, labels_unknown_step2))
+def best_weights(out_list, itr=-1, acc_col = 'step1_val_acc'):
+    """
+        choose the one that has closest accuracy to 0.5
+    """
+    best_i = 0
+    best_acc = 1
+    for i in range(len(out_list)):
+        curr_acc = out_list[i][acc_col].ffill(axis=1).iloc[itr, -1]
+        if np.abs(best_acc-0.5) > np.abs(curr_acc-0.5):
+            best_i = i
+            best_acc = curr_acc
     
-    inputs1 = Input((y.shape[1], ))
-    hidden_layer_1 = Dense(50, activation='relu')(inputs1)
-    hidden_layer_2 = Dense(50, activation='relu')(hidden_layer_1)
-    hidden_layer_3 = Dense(50, activation='relu')(hidden_layer_2)
-    outputs1 = Dense(1, activation='sigmoid')(hidden_layer_3)
-
-    model1 = Model(inputs=inputs1, outputs=outputs1)
-    
-    inputs2 = Input((x_mc.shape[1], ))
-    hidden_layer_4 = Dense(50, activation='relu')(inputs2)
-    hidden_layer_5 = Dense(50, activation='relu')(hidden_layer_4)
-    hidden_layer_6 = Dense(50, activation='relu')(hidden_layer_5)
-    outputs2 = Dense(1, activation='sigmoid')(hidden_layer_6)
-
-    model2 = Model(inputs=inputs2, outputs=outputs2)
-
-    # initial iterative weights are ones
-    weights_pull = np.ones(len(y_mc))
-    weights_push = np.ones(len(y_mc))
-    
-
-    for i in range(iterations):
-
-        print("\nITERATION: {}\n".format(i + 1))
-
-        # STEP 1: classify Sim. (which is reweighted by weights_push) to Data
-        # weights reweighted Sim. --> Data
-
-
-        print("STEP 1\n")
-
-        weights_1 = np.concatenate((weights_push * w, np.ones(len(y))))
-
-        weights_pull = weights_push * density_ratio_classifier(xvals_1, yvals_1, weights_1, y_mc, model1, verbose=verbose)
-        weights[i, :1, :] = weights_pull
-
-
-        # STEP 2: classify Gen. to reweighted Gen. (which is reweighted by weights_pull)
-        # weights Gen. --> reweighted Gen.
-
-        print("\nSTEP 2\n")
-
-        weights_2 = np.concatenate((np.ones(len(x_mc)), weights_pull * w))
-        # ones for Gen. (not MC weights), actual weights for (reweighted) Gen.
-
-        weights_push = density_ratio_classifier(xvals_2, yvals_2, weights_2, x_mc, model2, verbose=verbose)
-        weights[i, 1:2, :] = weights_push
-
-    return weights
-
-
-def ad_hoc_penalized_profile_omnifold(y, x_mc, y_mc, iterations, w_theta, theta_bar, theta0, no_penalty=False, verbose=0):
-
-    weights = np.empty(shape=(iterations, 4, len(x_mc)))
-    # shape = (iteration, step, event)
-
-    labels0 = np.zeros(len(x_mc))
-    labels_unknown = np.ones(len(y))
-    labels_unknown_step2 = np.ones(len(x_mc))
-
-    xvals_1 = np.concatenate((y_mc, y))
-    yvals_1 = np.concatenate((labels0, labels_unknown))
-
-    xvals_2 = np.concatenate((x_mc, x_mc))
-    yvals_2 = np.concatenate((labels0, labels_unknown_step2))
-    
-    inputs1 = Input((y.shape[1], ))
-    hidden_layer_1 = Dense(50, activation='relu')(inputs1)
-    hidden_layer_2 = Dense(50, activation='relu')(hidden_layer_1)
-    hidden_layer_3 = Dense(50, activation='relu')(hidden_layer_2)
-    outputs1 = Dense(1, activation='sigmoid')(hidden_layer_3)
-
-    model1 = Model(inputs=inputs1, outputs=outputs1)
-    
-    inputs2 = Input((x_mc.shape[1], ))
-    hidden_layer_4 = Dense(50, activation='relu')(inputs2)
-    hidden_layer_5 = Dense(50, activation='relu')(hidden_layer_4)
-    hidden_layer_6 = Dense(50, activation='relu')(hidden_layer_5)
-    outputs2 = Dense(1, activation='sigmoid')(hidden_layer_6)
-
-    model2 = Model(inputs=inputs2, outputs=outputs2)
-
-    # initial iterative weights are ones
-    weights_pull = np.ones(len(y_mc))
-    weights_push = np.ones(len(y_mc))
-    
-    theta = theta0
-
-    for i in range(iterations):
-        # initial weights on the response kernel are determined by the initial theta
-        w = w_theta(theta)
-        if (isinstance(w, torch.Tensor)):
-            w = w.cpu().numpy().flatten()
-
-        if (verbose>0):
-            print("\nITERATION: {}\n".format(i + 1))
-            pass
-
-        # STEP 1: classify Sim. (which is reweighted by weights_push) to Data
-        # weights reweighted Sim. --> Data
-
-        if (verbose>0):
-            print("STEP 1\n")
-            pass
-
-        weights_1 = np.concatenate((weights_push * w, np.ones(len(y))))
-
-
-        weights_pull = weights_push * density_ratio_classifier(xvals_1, yvals_1, weights_1, y_mc, model1, verbose=verbose)
-        weights[i, 0, :] = weights_pull
-
-
-        # STEP 2: classify Gen. to reweighted Gen. (which is reweighted by weights_pull)
-        # weights Gen. --> reweighted Gen.
-
-        if (verbose>0):
-            print("\nSTEP 2\n")
-            pass
-
-        weights_2 = np.concatenate((np.ones(len(x_mc)), weights_pull * w))
-        # ones for Gen. (not MC weights), actual weights for (reweighted) Gen.
-
-
-        weights_push = density_ratio_classifier(xvals_2, yvals_2, weights_2, x_mc, model2, verbose=verbose)
-        weights[i, 1, :] = weights_push
-
-        
-        # STEP 3: update theta
-        if (verbose>0):
-            print("\nSTEP 3\n")
-            print(f'Value of Theta before update: {theta}')
-            pass
-        
-        def theta_loss(x):
-            w = w_theta(x[0])
-            if (isinstance(w_theta, torch.Tensor)):
-                w_theta = w_theta.cpu().numpy().flatten()
-            if no_penalty == False:
-                return np.mean((w_theta - w * weights_pull / weights_push)**2) + (x[0]-theta_bar)**2/2
-            else:
-                return np.mean((w_theta - w * weights_pull / weights_push)**2)
-        
-        solution = optimize.minimize(fun=theta_loss, x0=theta, bounds=[(0,3)])
-        theta = solution.x[0]
-
-        if (verbose>0):
-            print(f'Updated value of Theta: {theta}')
-        w = w_theta(theta)
-        if (isinstance(w, torch.Tensor)):
-            w = w.cpu().numpy().flatten()
-        weights[i, 2, :] = w
-        weights[i, 3, :] = theta
-        
-    return weights
+    nu = out_list[best_i]['weights']
+    return nu, best_i
 
 #######################################################################################################
 # The classes below are neural networks for training w(y,x,theta) (adapted from https://github.com/jaychan-hep/UnbinnedProfiledUnfolding)
@@ -904,37 +707,6 @@ def test_w(test_dataloader, model_wRT, model_wT, theta, dvc=dvc):
     return Ts, Rs, Ws
 
 
-def test_w_derivative(test_dataloader, model_wRT, model_wT, theta, dvc=dvc):
-    # Ensure theta requires gradients
-    theta = torch.tensor([theta], dtype=torch.float32, requires_grad=True, device=dvc)
-
-    # Put models in evaluation mode
-    model_wRT.eval()
-    model_wT.eval()
-
-    # Variables to hold data
-    Ts, Rs, Ws, grad_Ws_theta = None, None, None, None
-
-    for batch, (T, R) in enumerate(test_dataloader):
-        T, R = T.to(dvc), R.to(dvc)
-        ones = torch.ones(len(R), 1).to(dvc)
-
-        # Compute weights (with theta requiring gradients)
-        W = model_wRT(T, R, ones * theta) / model_wT(T, R, ones * theta)
-        # Compute the gradient of W w.r.t theta for the entire batch
-        grad_W_theta = torch.autograd.grad(outputs=W, inputs=theta, 
-                                           grad_outputs=torch.ones_like(W))[0]
-                                           #create_graph=False, retain_graph=False)
-        #print(grad_W_theta.shape)
-
-        # Accumulate the data for Ts, Rs, Ws, and gradient of Ws (wrt theta)
-        Ts = torch.cat([Ts, T]) if Ts is not None else T
-        Rs = torch.cat([Rs, R]) if Rs is not None else R
-        Ws = torch.cat([Ws, W]) if Ws is not None else W
-        grad_Ws_theta = torch.cat([grad_Ws_theta, grad_W_theta]) if grad_Ws_theta is not None else grad_W_theta
-
-    return Ts, Rs, Ws, grad_Ws_theta
-
 def test_w_different_thetas(test_dataloader, model_wRT, model_wT, thetas, dvc=dvc):
     n = len(thetas)
 
@@ -991,87 +763,3 @@ def make_w_theta_ensemble(test_dataloader, model_wRT_ensemble, model_wT_ensemble
         else:
             return Ws
     return w_theta
-
-
-def make_w_theta_grad(test_dataloader, model_wRT, model_wT, dvc=dvc):
-    def w_func(theta, T, R):
-        wRT_val = model_wRT(T.reshape(1,-1), R.reshape(1,-1), theta.reshape(1,-1))
-        wT_val = model_wT(T.reshape(1,-1), R.reshape(1,-1), theta.reshape(1,-1))
-        return (wRT_val / wT_val).squeeze()
-    w_func_grad = grad(w_func)
-    compute_w_func_batch_grad = vmap(w_func_grad, in_dims=(None, 0, 0))
-
-    def w_theta_grad(theta):
-        grads = []
-        for batch, (T, R) in enumerate(test_dataloader):
-            gc.collect()
-            torch.cuda.empty_cache()
-            T, R = T.to(dvc), R.to(dvc)
-            w_func_batch_grad = compute_w_func_batch_grad(torch.tensor([theta],dtype=torch.float).to(dvc), T, R)
-            grads.append(w_func_batch_grad.cpu().detach())
-        return torch.cat(grads, dim=0).squeeze()
-
-    return w_theta_grad
-
-
-#def make_w_theta_derivative(test_dataloader, model_wRT, model_wT):
-#    def w_theta_derivative(theta):
-#        _, _, Ws = test_w_derivative(test_dataloader, model_wRT, model_wT, theta)
-#        return Ws
-#    return w_theta_derivative
-
-#def make_w_theta(test_dataloader, model_wRT, model_wT, dvc=dvc):
-#    def w_func(theta, T, R):
-#        wRT_val = model_wRT(T.reshape(1,-1), R.reshape(1,-1), theta.reshape(1,-1))
-#        wT_val = model_wT(T.reshape(1,-1), R.reshape(1,-1), theta.reshape(1,-1))
-#        return (wRT_val / wT_val).squeeze()
-#    w_func_grad = grad(w_func)
-#    compute_w_func_batch = vmap(w_func, in_dims=(None, 0, 0))
-#    compute_w_func_batch_grad = vmap(w_func_grad, in_dims=(None, 0, 0))
-        
-#    def w_theta(theta):
-#        results = []
-#        for batch, (T, R) in enumerate(test_dataloader):
-#            gc.collect()
-#            torch.cuda.empty_cache()
-#            T, R = T.to(dvc), R.to(dvc)
-#            w_func_batch = compute_w_func_batch(torch.tensor([theta],dtype=torch.float).to(dvc), T, R)
-#            results.append(w_func_batch.cpu().detach())
-#        return torch.cat(results, dim=0).squeeze()
-#    def w_theta_grad(theta):
-#        grads = []
-#        for batch, (T, R) in enumerate(test_dataloader):
-#            gc.collect()
-#            torch.cuda.empty_cache()
-#            T, R = T.to(dvc), R.to(dvc)
-#            w_func_batch_grad = compute_w_func_batch_grad(torch.tensor([theta],dtype=torch.float).to(dvc), T, R)
-#            grads.append(w_func_batch_grad.cpu().detach())
-#        return torch.cat(grads, dim=0).squeeze()
-
-#    return w_theta, w_theta_grad
-
-
-#def make_w_theta_true_w_func(test_dataloader, model_wRT, model_wT, w_func):
-#    def w_func_reorder(theta, T, R):
-#        return w_func(R.reshape(1,-1),T.reshape(1,-1),theta.reshape(1,-1)).squeeze()
-#    w_func_grad = grad(w_func_reorder)
-#    compute_w_func_batch = vmap(w_func_reorder, in_dims=(None, 0, 0))
-#    compute_w_func_batch_grad = vmap(w_func_grad, in_dims=(None, 0, 0))
-    
-    
-#    Ts, Rs = None, None
-#    for batch, (T, R) in enumerate(test_dataloader):
-#        T, R = T.to(dvc), R.to(dvc)
-#        Ts = torch.cat([Ts, T]) if Ts is not None else T
-#        Rs = torch.cat([Rs, R]) if Rs is not None else R
-        
-#    def w_theta(theta):
-#        gc.collect()
-#        torch.cuda.empty_cache()
-#        return compute_w_func_batch(torch.tensor([theta],dtype=torch.float).to(dvc), Ts, Rs).cpu().detach().squeeze()
-#    def w_theta_grad(theta):
-#        gc.collect()
-#        torch.cuda.empty_cache()
-#        return compute_w_func_batch_grad(torch.tensor([theta],dtype=torch.float).to(dvc), Ts, Rs).cpu().detach().squeeze()
-
-    return w_theta, w_theta_grad
