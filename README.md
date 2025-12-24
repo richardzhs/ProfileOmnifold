@@ -12,9 +12,6 @@ The repository currently includes the following files:
   1. `omnifold`: the original OmniFold algorithm.
   2. `profile_omnifold`: the Profile OmniFold algorithm.
 
-* **`profile_omnifold_no_nn.py`**
-  Contains the same methods as `profile_omnifold.py`, but replaces neural networks with non–neural network classifiers.
-
 * **`utils.py`**
   A coollection of utility functions used across the codebase.
 
