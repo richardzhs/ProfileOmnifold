@@ -5,11 +5,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
 from sklearn.linear_model import Ridge
-from scipy.stats import norm
 from scipy import optimize
-import scipy.integrate as integrate
-from scipy.interpolate import splrep, BSpline
-import pandas as pd
+import os
 
 
 def rejection_sampling(n, f, lb, ub, scale=1):

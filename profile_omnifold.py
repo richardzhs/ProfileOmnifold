@@ -442,7 +442,7 @@ def profile_omnifold(y, x_mc, y_mc, iterations, w_theta, theta_bar, theta0, thet
             if no_penalty:
                 return Q_out
             else:
-                return Q_out - (theta-theta_bar)**2/2
+                return Q_out - (x-theta_bar)**2/2
             
         
         theta_min, theta_max = theta_range[0], theta_range[1]
